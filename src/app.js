@@ -15,23 +15,26 @@ sdkLogger.configure({
   isDebugEnabled: process.env.CLOUD189_VERBOSE === "1",
 });
 
-// 个人任务签到
+// 个人任务签到；返回 { signed, bonus }
 const doUserTask = async (cloudClient, logger) => {
   const result = await cloudClient.userSign();
   if (result && result.isSign) {
     logger.info("个人签到任务: 今日已签到（重复执行不增加容量）");
-    return;
+    return { signed: false, bonus: 0 };
   }
-  logger.info(`个人签到任务: 获得 ${result.netdiskBonus}M 空间`);
+  const bonus = (result && result.netdiskBonus) || 0;
+  logger.info(`个人签到任务: 获得 ${bonus}M 空间`);
+  return { signed: true, bonus };
 };
 
-// 返回 true 表示该账号本次执行成功
+// 返回 { ok, signed }：ok 表示本次执行成功，signed 表示本次真的签上了
 const run = async (userName, password, ssonCookie, userSizeInfoMap, logger) => {
   if (!userName || (!password && !ssonCookie)) {
-    return false;
+    return { ok: false, signed: false };
   }
   const before = Date.now();
   let ok = true;
+  let signed = false;
   try {
     logger.log(ssonCookie ? "开始执行（SSON Cookie 登录）" : "开始执行（账号密码登录）");
     const cloudClient = new CloudClient({
@@ -46,7 +49,8 @@ const run = async (userName, password, ssonCookie, userSizeInfoMap, logger) => {
       userSizeInfo: beforeUserSizeInfo,
       logger,
     });
-    await Promise.all([doUserTask(cloudClient, logger)]);
+    const taskResult = await doUserTask(cloudClient, logger);
+    signed = !!taskResult.signed;
   } catch (e) {
     ok = false;
     if (e && e.response) {
@@ -60,7 +64,7 @@ const run = async (userName, password, ssonCookie, userSizeInfoMap, logger) => {
   } finally {
     logger.log(`执行完毕, 耗时 ${((Date.now() - before) / 1000).toFixed(2)} 秒`);
   }
-  return ok;
+  return { ok, signed };
 };
 
 // 开始执行程序
@@ -68,6 +72,7 @@ async function main() {
   //  用于统计实际容量变化
   const userSizeInfoMap = new Map();
   let failed = 0;
+  let signedCount = 0;
 
   for (let index = 0; index < accounts.length; index += 1) {
     const account = accounts[index];
@@ -76,8 +81,9 @@ async function main() {
     const logger = log4js.getLogger(userName);
     logger.addContext("user", userNameInfo);
     // eslint-disable-next-line no-await-in-loop
-    const ok = await run(userName, password, ssonCookie, userSizeInfoMap, logger);
-    if (!ok) failed += 1;
+    const result = await run(userName, password, ssonCookie, userSizeInfoMap, logger);
+    if (!result.ok) failed += 1;
+    if (result.signed) signedCount += 1;
   }
 
   // 数据汇总
@@ -117,11 +123,11 @@ async function main() {
     }
   }
 
-  return { total: accounts.length, failed };
+  return { total: accounts.length, failed, signed: signedCount };
 }
 
 (async () => {
-  let summary = { total: accounts.length, failed: accounts.length };
+  let summary = { total: accounts.length, failed: accounts.length, signed: 0 };
   try {
     summary = await main();
     // 等待日志文件写入
@@ -132,12 +138,18 @@ async function main() {
     const logs = catLogs();
     const events = recording.replay();
     const content = events.map((e) => `${e.data.join("")}`).join("  \n");
-    // 必须 await：否则进程退出时未完成的推送请求会被切断
-    try {
-      await push("天翼云盘自动签到任务", logs + content);
-      await delay(500);
-    } catch (e) {
-      console.error("推送失败:", e && e.message ? e.message : e);
+    // 只有“本次真的签上了”或“有失败”才推送，避免多通道重复轰炸
+    const shouldPush = summary.signed > 0 || summary.failed > 0;
+    if (shouldPush) {
+      // 必须 await：否则进程退出时未完成的推送请求会被切断
+      try {
+        await push("天翼云盘自动签到任务", logs + content);
+        await delay(500);
+      } catch (e) {
+        console.error("推送失败:", e && e.message ? e.message : e);
+      }
+    } else {
+      console.log("本次没有新增容量且无失败（今日已签到），跳过推送");
     }
     recording.erase();
     cleanLogs();
